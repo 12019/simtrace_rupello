@@ -44,6 +44,7 @@
 
 static struct apdu_split *as;
 static struct gsmtap_inst *g_gti;
+FILE* dump_usb_file  = 0;
 
 static int gsmtap_send_sim(const uint8_t *apdu, unsigned int len)
 {
@@ -128,6 +129,8 @@ static void print_help(void)
 		"\t-a\t--skip-atr\n"
 		"\t-h\t--help\n"
 		"\t-k\t--keep-running\n"
+		"\t-d\t--dump-usb\tfilename\n"
+		"\t-r\t--replay\tfilename\n"
 		"\n"
 		);
 }
@@ -137,6 +140,8 @@ static const struct option opts[] = {
 	{ "skip-atr", 0, 0, 'a' },
 	{ "help", 0, 0, 'h' },
 	{ "keep-running", 0, 0, 'k' },
+	{ "dump-usb", 1, 0, 'd' },
+	{ "replay", 1, 0, 'r' },
 	{ NULL, 0, 0, 0 }
 };
 
@@ -161,9 +166,44 @@ static void run_mainloop(struct libusb_device_handle *devh)
 			process_usb_msg(buf, xfer_len);
 			msg_count++;
 			byte_count += xfer_len;
+			if (dump_usb_file!=0) {
+				fwrite(&xfer_len,sizeof(xfer_len),1,dump_usb_file);
+				fwrite(buf,1,xfer_len,dump_usb_file);
+			}
 		}
 	}
 }
+
+static void replay_mainloop(FILE* dump_usb_file)
+{
+	unsigned int msg_count, byte_count = 0;
+	char buf[16*265];
+	int xfer_len=0;
+	int rc=0;
+	int nitems=0;
+
+	printf("Entering main replay loop\n");
+	apdu_split_reset(as);
+
+	while (1) {
+		nitems = fread(&xfer_len,sizeof(xfer_len),1,dump_usb_file);	
+		if(nitems!=1) {
+			return;
+		 }
+		printf("xfer_len:%d\n",xfer_len);
+		if (xfer_len > 0) {
+			nitems = fread(buf,1,xfer_len,dump_usb_file);
+			if(nitems!=xfer_len) {
+				return;
+			}
+			printf("URB: %s\n", osmo_hexdump(buf, rc));
+			process_usb_msg(buf, xfer_len);
+			msg_count++;
+			byte_count += xfer_len;
+			}
+	}
+}
+
 
 int main(int argc, char **argv)
 {
@@ -172,6 +212,8 @@ int main(int argc, char **argv)
 	int c, ret = 1;
 	int skip_atr = 0;
 	int keep_running = 0;
+	int dump_usb = 0;
+	int replay = 0;
 	struct libusb_device_handle *devh;
 
 	print_welcome();
@@ -179,7 +221,7 @@ int main(int argc, char **argv)
 	while (1) {
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "i:ahk", opts, &option_index);
+		c = getopt_long(argc, argv, "i:ahkd:r:", opts, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
@@ -195,6 +237,15 @@ int main(int argc, char **argv)
 			break;
 		case 'k':
 			keep_running = 1;
+			break;
+		case 'd':
+			dump_usb = 1;
+			dump_usb_file = fopen(optarg,"wb");
+			break;
+		case 'r':
+			replay = 1;
+			dump_usb_file =  fopen(optarg,"rb");
+			printf("replaying file %s...\n",optarg);
 			break;
 		}
 	}
@@ -216,29 +267,37 @@ int main(int argc, char **argv)
 	if (!as)
 		goto release_exit;
 
-	do {
-		devh = libusb_open_device_with_vid_pid(NULL, SIMTRACE_USB_VENDOR, SIMTRACE_USB_PRODUCT);
-		if (!devh) {
-			fprintf(stderr, "can't open USB device\n");
-			goto close_exit;
-		}
+	if (replay) {
+		printf("done replaying file...\n");
+		replay_mainloop(dump_usb_file);
+		fclose(dump_usb_file);
+	}
+	else
+	{
+		do {
+			devh = libusb_open_device_with_vid_pid(NULL, SIMTRACE_USB_VENDOR, SIMTRACE_USB_PRODUCT);
+			if (!devh) {
+				fprintf(stderr, "can't open USB device\n");
+				goto close_exit;
+			}
 
-		rc = libusb_claim_interface(devh, 0);
-		if (rc < 0) {
-			fprintf(stderr, "can't claim interface; rc=%d\n", rc);
-			goto close_exit;
-		}
+			rc = libusb_claim_interface(devh, 0);
+			if (rc < 0) {
+				fprintf(stderr, "can't claim interface; rc=%d\n", rc);
+				goto close_exit;
+			}
 
-		run_mainloop(devh);
-		ret = 0;
+			run_mainloop(devh);
+			ret = 0;
 
-		libusb_release_interface(devh, 0);
-close_exit:
-		if (devh)
-			libusb_close(devh);
-		if (keep_running)
-			sleep(1);
-	} while (keep_running);
+			libusb_release_interface(devh, 0);
+	close_exit:
+			if (devh)
+				libusb_close(devh);
+			if (keep_running)
+				sleep(1);
+		} while (keep_running);
+	}
 
 release_exit:
 	libusb_exit(NULL);
